@@ -34,7 +34,7 @@ jobs:
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          $password = $env:RDP_PASSWORD
+          $password = $env:google143.
 
           if ([string]::IsNullOrWhiteSpace($password)) {
               throw "Password missing"
