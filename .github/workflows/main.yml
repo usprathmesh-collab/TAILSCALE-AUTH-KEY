@@ -34,7 +34,7 @@ jobs:
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          $password = $env:google143.
+          $password = $env:RDP_PASSWORD
 
           if ([string]::IsNullOrWhiteSpace($password)) {
               throw "Password missing"
@@ -53,7 +53,7 @@ jobs:
 
           Write-Host "RDP user configured successfully"
           
-          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+    
           
           if (-not (Get-LocalUser -Name "RDP")) {
               Write-Error "User creation failed"
