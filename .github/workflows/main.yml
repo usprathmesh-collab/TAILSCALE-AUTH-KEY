@@ -1,4 +1,3 @@
-
 name: Secure RDP
 
 on:
@@ -6,36 +5,41 @@ on:
 
 jobs:
   secure-rdp:
-    runs-on: windows-latest
+    # Larger runner (Windows Server 2025). Free fallback: windows-2025
+    runs-on: win-fast
     timeout-minutes: 360
 
     env:
       RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
-      TS_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
 
     steps:
-      - name: Configure Windows RDP
+      - name: Configure Windows RDP and speed tweaks
         shell: pwsh
         run: |
-          Set-ItemProperty `
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name fDenyTSConnections -Value 0
-
-          Set-ItemProperty `
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name UserAuthentication -Value 1
-
+          # RDP on, NLA on
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -Value 1
           Set-Service TermService -StartupType Automatic
           Start-Service TermService
 
-          New-NetFirewallRule `
-            -DisplayName "RDP over Tailscale" `
-            -Direction Inbound `
-            -Protocol TCP `
-            -LocalPort 3389 `
-            -RemoteAddress 100.64.0.0/10 `
-            -Action Allow `
-            -ErrorAction SilentlyContinue
+          New-NetFirewallRule -DisplayName "RDP over Tailscale" -Direction Inbound `
+            -Protocol TCP -LocalPort 3389 -RemoteAddress 100.64.0.0/10 `
+            -Action Allow -ErrorAction SilentlyContinue
+
+          # Speed: High Performance power plan (no CPU throttling or sleep)
+          powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
+          powercfg /change monitor-timeout-ac 0
+          powercfg /change standby-timeout-ac 0
+
+          # Speed: stop Defender real-time scanning from slowing the disk and CPU
+          Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
+
+          # Speed: RDP prefers fast, smooth rendering
+          $ts = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+          New-Item -Path $ts -Force | Out-Null
+          Set-ItemProperty -Path $ts -Name fClientDisableUDP -Value 0 -Type DWord
+          Set-ItemProperty -Path $ts -Name fEnableVirtualizedGraphics -Value 1 -Type DWord
+          Set-ItemProperty -Path $ts -Name MaxCompressionLevel -Value 2 -Type DWord
 
       - name: Create RDP User
         shell: pwsh
@@ -44,87 +48,42 @@ jobs:
             throw "RDP_PASSWORD secret is missing"
           }
 
-          $securePass = ConvertTo-SecureString `
-            $env:RDP_PASSWORD -AsPlainText -Force
+          $securePass = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
 
           if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
             Set-LocalUser -Name "RDP" -Password $securePass
           }
           else {
-            New-LocalUser -Name "RDP" `
-              -Password $securePass `
-              -PasswordNeverExpires
+            New-LocalUser -Name "RDP" -Password $securePass -PasswordNeverExpires
           }
 
-          Add-LocalGroupMember `
-            -Group "Remote Desktop Users" `
-            -Member "RDP" `
-            -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
 
           Write-Host "RDP user configured successfully"
 
-      - name: Install Tailscale
-        shell: pwsh
-        run: |
-          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $file = "$env:TEMP\tailscale.msi"
-
-          Invoke-WebRequest $url -OutFile $file
-
-          Start-Process msiexec.exe `
-            -ArgumentList "/i `"$file`" /quiet /norestart" `
-            -Wait
-
-          Remove-Item $file -Force
-
+      # Faster than downloading the MSI by hand (uses cache)
       - name: Connect Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          hostname: secure-rdp-${{ github.run_id }}
+          use-cache: 'true'
+
+      - name: Show address and keep alive
         shell: pwsh
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:TS_AUTH_KEY)) {
-            throw "TAILSCALE_AUTH_KEY is missing"
-          }
-
           $exe = "$env:ProgramFiles\Tailscale\tailscale.exe"
-
-          & $exe up `
-            "--authkey=$env:TS_AUTH_KEY" `
-            "--hostname=secure-rdp-$env:GITHUB_RUN_ID"
-
           $ip = $null
 
-          for ($i = 0; $i -lt 20; $i++) {
-            $ip = (& $exe ip -4 | Select-Object -First 1).Trim()
-
-            if ($ip) { break }
-
-            Start-Sleep -Seconds 5
+          for ($i = 0; $i -lt 20 -and -not $ip; $i++) {
+            $ip = (& $exe ip -4 | Select-Object -First 1)
+            if (-not $ip) { Start-Sleep -Seconds 3 }
           }
 
-          if (-not $ip) {
-            throw "Tailscale IP unavailable"
-          }
+          if (-not $ip) { throw "Tailscale IP unavailable" }
 
-          "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
-
-          Write-Host "Tailscale connected"
-
-      - name: Verify RDP
-        shell: pwsh
-        run: |
-          $result = Test-NetConnection `
-            -ComputerName $env:TAILSCALE_IP `
-            -Port 3389
-
-          if (-not $result.TcpTestSucceeded) {
-            throw "RDP port 3389 is unavailable"
-          }
-
-          Write-Host "RDP connectivity successful"
-
-      - name: Maintain Connection
-        shell: pwsh
-        run: |
-          Write-Host "RDP ADDRESS: $env:TAILSCALE_IP"
+          Write-Host "RDP ADDRESS: $ip"
           Write-Host "USERNAME: .\RDP"
           Write-Host "Password is stored securely in GitHub Secrets"
 
